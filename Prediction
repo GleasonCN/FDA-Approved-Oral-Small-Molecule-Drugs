@@ -1,0 +1,339 @@
+import os
+import pickle
+import warnings
+import numpy as np
+import pandas as pd
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score, confusion_matrix, matthews_corrcoef
+
+warnings.filterwarnings("ignore")
+
+# =========================
+# Global configuration
+# =========================
+TRAIN_FILE = "training_set_features.xlsx"
+PRED_FILE = "validation_set_features_9.17.xlsx"
+MODEL_DIR = "results_classical_molecular_features_5fold_cv"
+
+OUTPUT_EXCEL = "validation_set_four_model_predictions.xlsx"
+HEATMAP_EXCEL = "validation_set_heatmap_raw_data.xlsx"
+CI_EXCEL = "validation_set_model_performance_95CI.xlsx"
+
+RANDOM_SEED = 42
+THRESHOLD = 0.5
+N_BOOTSTRAP = 2000
+
+# =========================
+# Models
+# =========================
+def build_models(random_seed=42):
+    return {
+        "RF": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("rf", RandomForestClassifier(n_estimators=300, max_depth=None, min_samples_split=2, min_samples_leaf=1,
+                                          random_state=random_seed, class_weight="balanced", n_jobs=-1))
+        ]),
+        "SVM": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("svm", SVC(C=1.0, kernel="rbf", probability=True, class_weight="balanced", random_state=random_seed))
+        ]),
+        "GB": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("gb", GradientBoostingClassifier(n_estimators=200, learning_rate=0.05, max_depth=3,
+                                              random_state=random_seed))
+        ]),
+        "LR": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(C=1.0, max_iter=5000, class_weight="balanced", random_state=random_seed))
+        ])
+    }
+
+# =========================
+# Utility functions
+# =========================
+def safe_numeric(df, cols):
+    for col in cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+def try_load_model(model_name, model_dir):
+    files = [
+        os.path.join(model_dir, f"{model_name}_model.pkl"),
+        os.path.join(model_dir, f"{model_name}_best_model.pkl")
+    ]
+    for f in files:
+        if os.path.exists(f):
+            with open(f, "rb") as fh:
+                model = pickle.load(fh)
+            print(f"Loaded model: {f}")
+            return model
+    return None
+
+def fit_model_from_train(model_name, X_train, y_train, random_seed=42):
+    model = build_models(random_seed)[model_name]
+    model.fit(X_train, y_train)
+    print(f"Saved model for {model_name} not found; refitted from training data.")
+    return model
+
+def calc_metrics(y_true, y_prob, threshold=0.5):
+    y_pred = (y_prob >= threshold).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) == 2 else np.nan
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+    pre = precision_score(y_true, y_pred, zero_division=0)
+    sen = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    spe = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    mcc = matthews_corrcoef(y_true, y_pred) if len(np.unique(y_pred)) > 1 else 0
+
+    return {
+        "Accuracy": acc,
+        "AUC": auc,
+        "F1": f1,
+        "Precision": pre,
+        "Sensitivity": sen,
+        "Specificity": spe,
+        "MCC": mcc,
+        "Correct_N": int((y_pred == y_true).sum()),
+        "Wrong_N": int((y_pred != y_true).sum())
+    }
+
+def bootstrap_ci(y_true, y_prob, threshold=0.5, n_bootstrap=2000, random_seed=42):
+    rng = np.random.default_rng(random_seed)
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+
+    names = ["Accuracy", "AUC", "F1", "Precision", "Sensitivity", "Specificity", "MCC"]
+    scores = {k: [] for k in names}
+    n = len(y_true)
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n, n)
+        yt, yp = y_true[idx], y_prob[idx]
+
+        # AUC requires bootstrap samples to contain both classes
+        if len(np.unique(yt)) < 2:
+            continue
+
+        m = calc_metrics(yt, yp, threshold)
+        for k in names:
+            if not pd.isna(m[k]):
+                scores[k].append(m[k])
+
+    out = {}
+    for k in names:
+        arr = np.asarray(scores[k], dtype=float)
+        if len(arr) == 0:
+            out[f"{k}_CI_Lower"] = np.nan
+            out[f"{k}_CI_Upper"] = np.nan
+        else:
+            out[f"{k}_CI_Lower"] = np.percentile(arr, 2.5)
+            out[f"{k}_CI_Upper"] = np.percentile(arr, 97.5)
+
+    return out
+
+# =========================
+# Read training set
+# =========================
+print("Reading training set...")
+train_df = pd.read_excel(TRAIN_FILE)
+train_df.columns = train_df.columns.astype(str).str.strip()
+
+if train_df.shape[1] < 3:
+    raise ValueError("The training set must contain at least 3 columns: Compound, feature columns, and Label.")
+
+train_drug_col = train_df.columns[0]
+train_label_col = train_df.columns[-1]
+feature_cols = list(train_df.columns[1:-1])
+
+train_df = train_df.dropna(subset=[train_drug_col, train_label_col]).copy()
+train_df[train_label_col] = pd.to_numeric(train_df[train_label_col], errors="coerce")
+train_df = train_df.dropna(subset=[train_label_col]).copy()
+train_df[train_label_col] = train_df[train_label_col].astype(int)
+train_df = safe_numeric(train_df, feature_cols)
+
+X_train = train_df[feature_cols].copy()
+y_train = train_df[train_label_col].values
+
+print(f"Training set shape: {train_df.shape}")
+print(f"Number of features: {len(feature_cols)}")
+
+# =========================
+# Read validation set
+# =========================
+print("\nReading validation set...")
+pred_df = pd.read_excel(PRED_FILE)
+pred_df.columns = pred_df.columns.astype(str).str.strip()
+
+if pred_df.shape[1] < 3:
+    raise ValueError("The validation set must contain at least 3 columns: Compound, feature columns, and Label.")
+
+pred_drug_col = pred_df.columns[0]
+pred_label_col = pred_df.columns[-1]
+pred_feature_cols = list(pred_df.columns[1:-1])
+
+missing_in_pred = [c for c in feature_cols if c not in pred_feature_cols]
+extra_in_pred = [c for c in pred_feature_cols if c not in feature_cols]
+
+if missing_in_pred:
+    raise ValueError(f"Validation set is missing feature columns required by training: {missing_in_pred}")
+
+if extra_in_pred:
+    print(f"Validation set has extra feature columns; these will be ignored: {extra_in_pred}")
+
+pred_df = pred_df.dropna(subset=[pred_drug_col, pred_label_col]).copy()
+pred_df[pred_label_col] = pd.to_numeric(pred_df[pred_label_col], errors="coerce")
+pred_df = pred_df.dropna(subset=[pred_label_col]).copy()
+pred_df[pred_label_col] = pred_df[pred_label_col].astype(int)
+pred_df = safe_numeric(pred_df, feature_cols)
+
+X_pred = pred_df[feature_cols].copy()
+y_true = pred_df[pred_label_col].values
+compound_names = pred_df[pred_drug_col].astype(str).values
+
+print(f"Validation set shape: {pred_df.shape}")
+print(f"Number of validation samples: {len(pred_df)}")
+print(f"Label distribution: {dict(pd.Series(y_true).value_counts())}")
+
+# =========================
+# Four-model prediction
+# =========================
+model_names = ["RF", "SVM", "GB", "LR"]
+pred_result_df = pd.DataFrame({"Compound": compound_names, "True_Label": y_true})
+metrics_summary = []
+ci_summary = []
+
+print("\nStarting four-model prediction...")
+
+for model_name in model_names:
+    model = try_load_model(model_name, MODEL_DIR)
+
+    if model is None:
+        model = fit_model_from_train(model_name, X_train, y_train, RANDOM_SEED)
+
+    y_prob = model.predict_proba(X_pred)[:, 1]
+    y_prob = np.clip(y_prob, 1e-6, 1 - 1e-6)
+    y_pred = (y_prob >= THRESHOLD).astype(int)
+
+    pred_result_df[f"{model_name}_Prob"] = y_prob
+    pred_result_df[f"{model_name}_Pred"] = y_pred
+    pred_result_df[f"{model_name}_Correct"] = (y_pred == y_true).astype(int)
+    pred_result_df[f"{model_name}_AbsError"] = np.abs(y_prob - y_true)
+
+    metrics = calc_metrics(y_true, y_prob, THRESHOLD)
+    metrics_summary.append({"Model": model_name, **metrics})
+
+    ci = bootstrap_ci(y_true, y_prob, THRESHOLD, N_BOOTSTRAP, RANDOM_SEED)
+    ci_summary.append({"Model": model_name, **metrics, **ci})
+
+    print(
+        f"{model_name}: "
+        f"Acc={metrics['Accuracy']:.4f}, "
+        f"AUC={metrics['AUC']:.4f}, "
+        f"F1={metrics['F1']:.4f}, "
+        f"MCC={metrics['MCC']:.4f}"
+    )
+
+metrics_df = pd.DataFrame(metrics_summary)
+ci_df = pd.DataFrame(ci_summary)
+
+# =========================
+# Mean probability across the four models
+# =========================
+prob_cols = [f"{m}_Prob" for m in model_names]
+pred_result_df["Mean_Prob"] = pred_result_df[prob_cols].mean(axis=1)
+pred_result_df["Mean_Pred"] = (pred_result_df["Mean_Prob"] >= THRESHOLD).astype(int)
+pred_result_df["Mean_Correct"] = (pred_result_df["Mean_Pred"] == pred_result_df["True_Label"]).astype(int)
+pred_result_df["Mean_AbsError"] = np.abs(pred_result_df["Mean_Prob"] - pred_result_df["True_Label"])
+
+mean_metrics = calc_metrics(y_true, pred_result_df["Mean_Prob"].values, THRESHOLD)
+mean_ci = bootstrap_ci(y_true, pred_result_df["Mean_Prob"].values, THRESHOLD, N_BOOTSTRAP, RANDOM_SEED)
+
+metrics_df = pd.concat([metrics_df, pd.DataFrame([{"Model": "Mean", **mean_metrics}])], ignore_index=True)
+ci_df = pd.concat([ci_df, pd.DataFrame([{"Model": "Mean", **mean_metrics, **mean_ci}])], ignore_index=True)
+
+# =========================
+# Save full prediction results
+# =========================
+with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
+    pred_result_df.to_excel(writer, sheet_name="Four_Model_Predictions", index=False)
+    metrics_df.to_excel(writer, sheet_name="Model_Summary_Metrics", index=False)
+
+print(f"\nPrediction results saved: {OUTPUT_EXCEL}")
+
+# =========================
+# Output Bootstrap 95% CI
+# =========================
+ci_df.to_excel(CI_EXCEL, index=False)
+print(f"95% CI results saved: {CI_EXCEL}")
+
+# =========================
+# Output heatmap data
+# =========================
+correctness_df = pd.DataFrame({
+    "Compound": pred_result_df["Compound"],
+    "True_Label": pred_result_df["True_Label"]
+})
+
+probability_df = pd.DataFrame({
+    "Compound": pred_result_df["Compound"],
+    "True_Label": pred_result_df["True_Label"]
+})
+
+error_df = pd.DataFrame({
+    "Compound": pred_result_df["Compound"],
+    "True_Label": pred_result_df["True_Label"]
+})
+
+for m in model_names:
+    correctness_df[m] = pred_result_df[f"{m}_Correct"]
+    probability_df[m] = pred_result_df[f"{m}_Prob"]
+    error_df[m] = pred_result_df[f"{m}_AbsError"]
+
+correctness_df["Mean"] = pred_result_df["Mean_Correct"]
+probability_df["Mean"] = pred_result_df["Mean_Prob"]
+error_df["Mean"] = pred_result_df["Mean_AbsError"]
+
+with pd.ExcelWriter(HEATMAP_EXCEL, engine="openpyxl") as writer:
+    correctness_df.to_excel(writer, sheet_name="Correctness", index=False)
+    probability_df.to_excel(writer, sheet_name="Probability", index=False)
+    error_df.to_excel(writer, sheet_name="Absolute_Error", index=False)
+
+print(f"Heatmap raw data saved: {HEATMAP_EXCEL}")
+
+# =========================
+# Console output
+# =========================
+print("\n" + "=" * 100)
+print("Model summary metrics")
+print("=" * 100)
+print(metrics_df.round(4).to_string(index=False))
+
+print("\n" + "=" * 100)
+print("Bootstrap 95% CI")
+print("=" * 100)
+
+show_cols = [
+    "Model",
+    "Accuracy", "Accuracy_CI_Lower", "Accuracy_CI_Upper",
+    "AUC", "AUC_CI_Lower", "AUC_CI_Upper",
+    "MCC", "MCC_CI_Lower", "MCC_CI_Upper"
+]
+
+print(ci_df[show_cols].round(4).to_string(index=False))
+
+print("\n" + "=" * 100)
+print("First 10 prediction results")
+print("=" * 100)
+print(pred_result_df.head(10).round(4).to_string(index=False))
+
+print("\nAll done.")
