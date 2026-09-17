@@ -1,0 +1,649 @@
+import os
+import warnings
+import pickle
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import shap
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, f1_score, roc_auc_score, precision_score,
+    recall_score, matthews_corrcoef, confusion_matrix,
+    roc_curve, auc, precision_recall_curve, average_precision_score
+)
+from sklearn.calibration import calibration_curve
+
+warnings.filterwarnings("ignore")
+
+# =========================
+# Global configuration
+# =========================
+INPUT_FILE = "training_set_features.xlsx"
+OUTPUT_DIR = "results_classical_molecular_features_5fold_cv"
+RANDOM_SEED = 42
+N_SPLITS = 5
+
+# SHAP-related
+MAX_BACKGROUND_SAMPLES = 100
+MAX_EXPLAIN_SAMPLES = 200
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# =========================
+# Global plotting style
+# =========================
+plt.rcParams["font.sans-serif"] = ["Arial"]
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["figure.dpi"] = 150
+plt.rcParams["font.weight"] = "bold"
+plt.rcParams["axes.titleweight"] = "bold"
+plt.rcParams["axes.labelweight"] = "bold"
+
+# =========================
+# Read data
+# =========================
+print("Reading feature data...")
+df = pd.read_excel(INPUT_FILE)
+
+if df.shape[1] < 3:
+    raise ValueError("The input file must contain at least 3 columns: drug, features, and label.")
+
+drug_col = df.columns[0]
+label_col = df.columns[-1]
+feature_cols = list(df.columns[1:-1])
+
+print(f"Data shape: {df.shape}")
+print(f"Drug column: {drug_col}")
+print(f"Number of features: {len(feature_cols)}")
+print(f"Label column: {label_col}")
+
+df = df.dropna(subset=[drug_col, label_col]).copy()
+df[label_col] = pd.to_numeric(df[label_col], errors="coerce")
+df = df.dropna(subset=[label_col]).copy()
+df[label_col] = df[label_col].astype(int)
+
+for col in feature_cols:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+X = df[feature_cols].copy()
+y = df[label_col].values
+drug_names = df[drug_col].astype(str).values
+
+print(f"Number of samples after cleaning: {len(df)}")
+print(f"Label distribution:\n{pd.Series(y).value_counts().sort_index()}")
+
+# =========================
+# Define models
+# =========================
+def build_models(random_seed=42):
+    models = {
+        "RF": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("rf", RandomForestClassifier(
+                n_estimators=300,
+                max_depth=None,
+                min_samples_split=2,
+                min_samples_leaf=1,
+                random_state=random_seed,
+                class_weight="balanced",
+                n_jobs=-1
+            ))
+        ]),
+
+        "SVM": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("svm", SVC(
+                C=1.0,
+                kernel="rbf",
+                probability=True,
+                class_weight="balanced",
+                random_state=random_seed
+            ))
+        ]),
+
+        "GB": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("gb", GradientBoostingClassifier(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=3,
+                random_state=random_seed
+            ))
+        ]),
+
+        "LR": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("lr", LogisticRegression(
+                C=1.0,
+                max_iter=5000,
+                class_weight="balanced",
+                random_state=random_seed
+            ))
+        ])
+    }
+    return models
+
+# =========================
+# Performance metric function
+# =========================
+def calculate_metrics(y_true, y_pred, y_prob, model_name, fold_id):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    return {
+        "Model": model_name,
+        "Fold": fold_id,
+        "Accuracy": round(accuracy_score(y_true, y_pred), 4),
+        "AUC": round(roc_auc_score(y_true, y_prob), 4),
+        "F1": round(f1_score(y_true, y_pred, zero_division=0), 4),
+        "Precision": round(precision_score(y_true, y_pred, zero_division=0), 4),
+        "Sensitivity": round(recall_score(y_true, y_pred, zero_division=0), 4),
+        "Specificity": round(tn / (tn + fp) if (tn + fp) > 0 else 0, 4),
+        "MCC": round(matthews_corrcoef(y_true, y_pred), 4),
+        "TN": int(tn),
+        "FP": int(fp),
+        "FN": int(fn),
+        "TP": int(tp)
+    }
+
+# =========================
+# Five-fold cross-validation
+# =========================
+print("\nStarting five-fold cross-validation...")
+
+skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_SEED)
+models = build_models(RANDOM_SEED)
+
+all_fold_metrics = []
+all_probs = {name: [] for name in models}
+all_preds = {name: [] for name in models}
+all_true = []
+all_test_indices = []
+
+for fold, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
+    print(f"\n========== Fold {fold} ==========")
+
+    X_train = X.iloc[train_idx].copy()
+    X_test = X.iloc[test_idx].copy()
+    y_train = y[train_idx]
+    y_test = y[test_idx]
+
+    all_true.extend(y_test.tolist())
+    all_test_indices.extend(test_idx.tolist())
+
+    fold_models = build_models(RANDOM_SEED + fold)
+
+    for name, model in fold_models.items():
+        print(f"Training {name} ...")
+        model.fit(X_train, y_train)
+
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+        y_prob = np.clip(y_prob, 1e-6, 1 - 1e-6)
+
+        all_preds[name].extend(y_pred.tolist())
+        all_probs[name].extend(y_prob.tolist())
+
+        metrics = calculate_metrics(y_test, y_pred, y_prob, name, fold)
+        all_fold_metrics.append(metrics)
+
+# =========================
+# Save per-fold performance
+# =========================
+df_fold_metrics = pd.DataFrame(all_fold_metrics)
+fold_metrics_path = os.path.join(OUTPUT_DIR, "cv_per_fold_metrics.xlsx")
+df_fold_metrics.to_excel(fold_metrics_path, index=False)
+
+print("\n" + "=" * 80)
+print("Per-fold performance metrics")
+print("=" * 80)
+print(df_fold_metrics.to_string(index=False))
+
+# =========================
+# Compute five-fold mean performance
+# =========================
+df_mean_metrics = df_fold_metrics.groupby("Model", as_index=False).agg({
+    "Accuracy": "mean",
+    "AUC": "mean",
+    "F1": "mean",
+    "Precision": "mean",
+    "Sensitivity": "mean",
+    "Specificity": "mean",
+    "MCC": "mean"
+})
+
+df_std_metrics = df_fold_metrics.groupby("Model", as_index=False).agg({
+    "Accuracy": "std",
+    "AUC": "std",
+    "F1": "std",
+    "Precision": "std",
+    "Sensitivity": "std",
+    "Specificity": "std",
+    "MCC": "std"
+})
+
+df_mean_metrics = df_mean_metrics.sort_values(
+    by=["AUC", "F1", "MCC", "Accuracy"],
+    ascending=False
+).reset_index(drop=True)
+
+mean_metrics_path = os.path.join(OUTPUT_DIR, "cv_mean_metrics.xlsx")
+std_metrics_path = os.path.join(OUTPUT_DIR, "cv_std_metrics.xlsx")
+
+df_mean_metrics.to_excel(mean_metrics_path, index=False)
+df_std_metrics.to_excel(std_metrics_path, index=False)
+
+print("\n" + "=" * 80)
+print("Five-fold mean performance")
+print("=" * 80)
+print(df_mean_metrics.to_string(index=False))
+
+print("\n" + "=" * 80)
+print("Five-fold standard deviation")
+print("=" * 80)
+print(df_std_metrics.to_string(index=False))
+
+# =========================
+# Aggregate cross-validation predictions
+# =========================
+cv_pred_df = pd.DataFrame({
+    "Index": all_test_indices,
+    "Drug": drug_names[all_test_indices],
+    "True_Label": np.array(all_true)
+})
+
+for name in models:
+    cv_pred_df[f"{name}_Pred"] = np.array(all_preds[name])
+    cv_pred_df[f"{name}_Prob"] = np.array(all_probs[name])
+
+cv_pred_df = cv_pred_df.sort_values("Index").reset_index(drop=True)
+cv_pred_df.to_excel(os.path.join(OUTPUT_DIR, "cv_aggregated_predictions.xlsx"), index=False)
+
+# =========================
+# Select the best model
+# =========================
+best_model_name = df_mean_metrics.loc[0, "Model"]
+print(f"\nBest model in five-fold CV: {best_model_name}")
+
+# =========================
+# Plot 1: ROC curves (based on aggregated CV predictions)
+# =========================
+plt.figure(figsize=(8, 6))
+y_true_all = cv_pred_df["True_Label"].values
+
+for name in models:
+    y_prob_all = cv_pred_df[f"{name}_Prob"].values
+    fpr, tpr, _ = roc_curve(y_true_all, y_prob_all)
+    roc_auc = auc(fpr, tpr)
+    plt.plot(fpr, tpr, lw=2.5, label=f"{name} (AUC = {roc_auc:.3f})")
+
+plt.plot([0, 1], [0, 1], 'k--', lw=1.5, label="Random")
+plt.xlabel("False Positive Rate", fontsize=12, fontweight='bold')
+plt.ylabel("True Positive Rate", fontsize=12, fontweight='bold')
+plt.title("ROC Curves (5-Fold Cross Validation)", fontsize=14, fontweight='bold')
+plt.legend(loc='lower right', fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Plot 2: Calibration curves
+# =========================
+plt.figure(figsize=(8, 6))
+plt.plot([0, 1], [0, 1], 'k--', lw=1.5, label="Perfect Calibration")
+
+for name in models:
+    try:
+        y_prob_all = cv_pred_df[f"{name}_Prob"].values
+        n_bins = min(5, max(2, len(y_true_all) // 20))
+        prob_true, prob_pred = calibration_curve(
+            y_true_all, y_prob_all, n_bins=n_bins, strategy='quantile'
+        )
+        plt.plot(prob_pred, prob_true, marker='s', lw=2, markersize=6, label=name)
+    except Exception as e:
+        print(f"Warning: calibration curve for {name} failed ({e}), skipped")
+
+plt.xlabel("Mean Predicted Probability", fontsize=12, fontweight='bold')
+plt.ylabel("Fraction of Positives", fontsize=12, fontweight='bold')
+plt.title("Calibration Curves (5-Fold Cross Validation)", fontsize=14, fontweight='bold')
+plt.legend(loc='lower right', fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Plot 3: Confusion matrices
+# =========================
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, name in zip(axes, models.keys()):
+    y_pred_all = cv_pred_df[f"{name}_Pred"].values
+    cm = confusion_matrix(y_true_all, y_pred_all, labels=[0, 1])
+
+    sns.heatmap(
+        cm, annot=True, fmt='d', cmap='Blues',
+        xticklabels=['Negative', 'Positive'],
+        yticklabels=['Negative', 'Positive'],
+        annot_kws={'size': 12, 'weight': 'bold'},
+        cbar=False, ax=ax
+    )
+    ax.set_title(name, fontsize=12, fontweight='bold')
+    ax.set_xlabel('Predicted', fontsize=11)
+    ax.set_ylabel('True', fontsize=11)
+
+plt.suptitle("Confusion Matrices (5-Fold Cross Validation)", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Plot 4: Error bias plot
+# =========================
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, name in zip(axes, models.keys()):
+    y_pred_all = cv_pred_df[f"{name}_Pred"].values
+    y_prob_all = cv_pred_df[f"{name}_Prob"].values
+
+    error_mask = (y_true_all != y_pred_all)
+    true_labels = y_true_all[error_mask]
+    pred_probs = y_prob_all[error_mask]
+
+    if len(true_labels) == 0:
+        ax.text(0.5, 0.5, "No misclassified samples", ha='center', va='center', fontsize=11)
+        ax.set_title(name, fontsize=12, fontweight='bold')
+        continue
+
+    error_bias = np.abs(true_labels - pred_probs)
+    bias_0 = error_bias[true_labels == 0]
+    bias_1 = error_bias[true_labels == 1]
+    data = [bias_0, bias_1]
+
+    bp = ax.boxplot(
+        data, positions=[0, 1], widths=0.45, patch_artist=True,
+        showfliers=False, medianprops=dict(color='black', linewidth=1.5)
+    )
+    for patch, color in zip(bp['boxes'], ['lightblue', 'lightcoral']):
+        patch.set_facecolor(color)
+
+    np.random.seed(RANDOM_SEED)
+    for d_i, pos in zip(data, [0, 1]):
+        if len(d_i) > 0:
+            x = np.random.normal(pos, 0.06, size=len(d_i))
+            ax.scatter(x, d_i, c='black', alpha=0.5, s=10)
+
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(['Negative (0)', 'Positive (1)'], fontsize=10)
+    ax.set_ylabel('Error Bias', fontsize=11)
+    ax.set_title(name, fontsize=12, fontweight='bold')
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(alpha=0.25)
+
+plt.suptitle("Error Bias (5-Fold Cross Validation)", fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Plot 5: Probability distribution
+# =========================
+fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+for ax, name in zip(axes, models.keys()):
+    probs = cv_pred_df[f"{name}_Prob"].values
+    prob_neg = probs[y_true_all == 0]
+    prob_pos = probs[y_true_all == 1]
+
+    ax.hist(prob_neg, bins=20, alpha=0.6, label='Negative', density=True)
+    ax.hist(prob_pos, bins=20, alpha=0.6, label='Positive', density=True)
+    ax.axvline(0.5, ls='--', c='gray', alpha=0.8, label='Threshold 0.5')
+    ax.set_xlabel('Predicted Probability', fontsize=11)
+    ax.set_ylabel('Density', fontsize=11)
+    ax.set_title(name, fontsize=12, fontweight='bold')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.25)
+
+plt.suptitle('Predicted Probability Distribution by True Class (5-Fold CV)', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Plot 6: PR curves
+# =========================
+plt.figure(figsize=(8, 6))
+for name in models:
+    y_prob_all = cv_pred_df[f"{name}_Prob"].values
+    precision, recall, _ = precision_recall_curve(y_true_all, y_prob_all)
+    ap = average_precision_score(y_true_all, y_prob_all)
+    plt.plot(recall, precision, lw=2.5, label=f'{name} (AP = {ap:.3f})')
+
+baseline = y_true_all.mean()
+plt.axhline(baseline, ls='--', c='gray', alpha=0.7, label=f'Baseline = {baseline:.3f}')
+plt.xlabel('Recall (Sensitivity)', fontsize=12, fontweight='bold')
+plt.ylabel('Precision', fontsize=12, fontweight='bold')
+plt.title('Precision-Recall Curves (5-Fold Cross Validation)', fontsize=14, fontweight='bold')
+plt.legend(loc='best', fontsize=11)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Retrain the best model on the full dataset
+# =========================
+print(f"\nRetraining the best model {best_model_name} on the full dataset...")
+final_models = build_models(RANDOM_SEED)
+best_model = final_models[best_model_name]
+best_model.fit(X, y)
+
+with open(os.path.join(OUTPUT_DIR, f"{best_model_name}_best_model.pkl"), "wb") as f:
+    pickle.dump(best_model, f)
+
+# =========================
+# Save basic information about the best model
+# =========================
+best_info = {
+    "best_model_name": best_model_name,
+    "feature_names": feature_cols,
+    "drug_column": drug_col,
+    "label_column": label_col,
+    "n_splits": N_SPLITS,
+    "random_seed": RANDOM_SEED,
+    "cv_type": "StratifiedKFold"
+}
+with open(os.path.join(OUTPUT_DIR, "best_model_info.json"), "w", encoding="utf-8") as f:
+    json.dump(best_info, f, ensure_ascii=False, indent=2)
+
+# =========================
+# Compute SHAP values for the best model
+# =========================
+print(f"\nComputing SHAP values for the best model {best_model_name}...")
+
+X_df = X.copy()
+
+if best_model_name == "RF":
+    imputer = best_model.named_steps["imputer"]
+    estimator = best_model.named_steps["rf"]
+
+    X_proc = pd.DataFrame(imputer.fit_transform(X_df), columns=feature_cols, index=X_df.index)
+
+elif best_model_name == "GB":
+    imputer = best_model.named_steps["imputer"]
+    estimator = best_model.named_steps["gb"]
+
+    X_proc = pd.DataFrame(imputer.fit_transform(X_df), columns=feature_cols, index=X_df.index)
+
+elif best_model_name == "LR":
+    imputer = best_model.named_steps["imputer"]
+    scaler = best_model.named_steps["scaler"]
+    estimator = best_model.named_steps["lr"]
+
+    X_imp = pd.DataFrame(imputer.fit_transform(X_df), columns=feature_cols, index=X_df.index)
+    X_proc = pd.DataFrame(scaler.fit_transform(X_imp), columns=feature_cols, index=X_imp.index)
+
+elif best_model_name == "SVM":
+    imputer = best_model.named_steps["imputer"]
+    scaler = best_model.named_steps["scaler"]
+    estimator = best_model.named_steps["svm"]
+
+    X_imp = pd.DataFrame(imputer.fit_transform(X_df), columns=feature_cols, index=X_df.index)
+    X_proc = pd.DataFrame(scaler.fit_transform(X_imp), columns=feature_cols, index=X_imp.index)
+
+else:
+    raise ValueError("Unsupported best model type")
+
+# Sampling for explanation
+if len(X_proc) > MAX_BACKGROUND_SAMPLES:
+    X_background = X_proc.sample(MAX_BACKGROUND_SAMPLES, random_state=RANDOM_SEED)
+else:
+    X_background = X_proc.copy()
+
+if len(X_proc) > MAX_EXPLAIN_SAMPLES:
+    X_explain = X_proc.sample(MAX_EXPLAIN_SAMPLES, random_state=RANDOM_SEED)
+    y_explain = y[X_explain.index]
+    drug_explain = drug_names[X_explain.index]
+else:
+    X_explain = X_proc.copy()
+    y_explain = y
+    drug_explain = drug_names
+
+explainer_type = None
+shap_values_to_save = None
+base_values_to_save = None
+
+if best_model_name in ["RF", "GB"]:
+    explainer = shap.TreeExplainer(estimator)
+    shap_exp = explainer(X_explain)
+    shap_values_to_save = shap_exp.values
+    base_values_to_save = shap_exp.base_values
+    explainer_type = "TreeExplainer"
+
+elif best_model_name == "LR":
+    explainer = shap.LinearExplainer(estimator, X_background)
+    shap_values_to_save = explainer.shap_values(X_explain)
+    if isinstance(shap_values_to_save, list):
+        shap_values_to_save = shap_values_to_save[1]
+    try:
+        base_values_to_save = explainer.expected_value
+    except:
+        base_values_to_save = None
+    explainer_type = "LinearExplainer"
+
+elif best_model_name == "SVM":
+    predict_fn = lambda data: estimator.predict_proba(data)[:, 1]
+    explainer = shap.KernelExplainer(predict_fn, X_background)
+    shap_values_to_save = explainer.shap_values(X_explain, nsamples=100)
+    if isinstance(shap_values_to_save, list):
+        shap_values_to_save = shap_values_to_save[1]
+    try:
+        base_values_to_save = explainer.expected_value
+    except:
+        base_values_to_save = None
+    explainer_type = "KernelExplainer"
+
+shap_values_to_save = np.array(shap_values_to_save)
+if shap_values_to_save.ndim == 3:
+    shap_values_to_save = shap_values_to_save[:, :, 1]
+if shap_values_to_save.ndim == 1:
+    shap_values_to_save = shap_values_to_save.reshape(-1, 1)
+
+# Save raw SHAP data
+shap_output = {
+    "best_model_name": best_model_name,
+    "explainer_type": explainer_type,
+    "feature_names": feature_cols,
+    "X_explain": X_explain.values,
+    "y_explain": np.array(y_explain),
+    "drug_explain": np.array(drug_explain),
+    "shap_values": shap_values_to_save,
+    "base_values": np.array(base_values_to_save) if base_values_to_save is not None else None
+}
+
+with open(os.path.join(OUTPUT_DIR, "best_model_shap_data.pkl"), "wb") as f:
+    pickle.dump(shap_output, f)
+
+df_explain = pd.DataFrame(X_explain, columns=feature_cols)
+df_explain.insert(0, "Drug", drug_explain)
+df_explain["Label"] = y_explain
+df_explain.to_excel(os.path.join(OUTPUT_DIR, "best_model_shap_input.xlsx"), index=False)
+
+df_shap = pd.DataFrame(shap_values_to_save, columns=feature_cols)
+df_shap.insert(0, "Drug", drug_explain)
+df_shap["Label"] = y_explain
+df_shap.to_excel(os.path.join(OUTPUT_DIR, "best_model_shap_values.xlsx"), index=False)
+
+mean_abs_shap = np.abs(shap_values_to_save).mean(axis=0)
+df_shap_importance = pd.DataFrame({
+    "Feature": feature_cols,
+    "MeanAbsSHAP": mean_abs_shap
+}).sort_values("MeanAbsSHAP", ascending=False).reset_index(drop=True)
+
+df_shap_importance.to_excel(os.path.join(OUTPUT_DIR, "best_model_shap_importance.xlsx"), index=False)
+
+print("\nTop 10 features by SHAP for the best model:")
+print(df_shap_importance.head(10).to_string(index=False))
+
+# =========================
+# Compute directional SHAP contributions (positive mean vs negative mean)
+# =========================
+print("\nComputing directional SHAP contributions (positive/negative)...")
+
+pos_mean_shap = []
+neg_mean_shap = []
+
+for i, feat in enumerate(feature_cols):
+    feat_shap = shap_values_to_save[:, i]
+    pos_mask = feat_shap > 0
+    neg_mask = feat_shap < 0
+
+    pos_avg = feat_shap[pos_mask].mean() if np.any(pos_mask) else 0.0
+    neg_avg = np.abs(feat_shap[neg_mask]).mean() if np.any(neg_mask) else 0.0
+
+    pos_mean_shap.append(pos_avg)
+    neg_mean_shap.append(neg_avg)
+
+df_shap_dir = pd.DataFrame({
+    "Feature": feature_cols,
+    "Mean_Positive_SHAP": pos_mean_shap,
+    "Mean_Negative_SHAP (abs)": neg_mean_shap,
+    "Mean_Absolute_SHAP": mean_abs_shap
+})
+
+df_shap_dir = df_shap_dir.sort_values("Mean_Absolute_SHAP", ascending=False).reset_index(drop=True)
+dir_output_path = os.path.join(OUTPUT_DIR, "best_model_shap_directional_contributions.xlsx")
+df_shap_dir.to_excel(dir_output_path, index=False)
+
+print(f"Saved directional SHAP contribution table: {dir_output_path}")
+print("\nTop 10 features by directional SHAP contribution:")
+print(df_shap_dir.head(10).to_string(index=False))
+
+# =========================
+# Plot top SHAP feature bar chart
+# =========================
+plt.figure(figsize=(8, 5))
+top_df = df_shap_importance.head(min(10, len(df_shap_importance))).iloc[::-1]
+plt.barh(top_df["Feature"], top_df["MeanAbsSHAP"])
+plt.xlabel("Mean |SHAP value|", fontsize=12, fontweight="bold")
+plt.title(f"Top SHAP Features ({best_model_name})", fontsize=14, fontweight="bold")
+plt.grid(alpha=0.3, axis="x")
+plt.tight_layout()
+plt.show()
+
+print("\nFive-fold cross-validation training completed.")
+print(f"Result directory: {OUTPUT_DIR}")
+print("Key output files:")
+print("1. cv_per_fold_metrics.xlsx")
+print("2. cv_mean_metrics.xlsx")
+print("3. cv_std_metrics.xlsx")
+print("4. cv_aggregated_predictions.xlsx")
+print("5. best_model_info.json")
+print("6. best_model_shap_data.pkl")
+print("7. best_model_shap_input.xlsx")
+print("8. best_model_shap_values.xlsx")
+print("9. best_model_shap_importance.xlsx")
+print("10. best_model_shap_directional_contributions.xlsx")
